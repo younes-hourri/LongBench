@@ -1,0 +1,5 @@
+{
+    "default" : {},
+    "h2o" : {"recent" : 0, "hh" : 4096},
+    "snapkv" : {"hh": 4096}
+}

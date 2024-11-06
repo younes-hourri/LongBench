@@ -10,11 +10,26 @@ import argparse
 from llama_flash_attn_monkey_patch import replace_llama_attn_with_flash_attn
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from cache import llama_attention, custom_cache
+from transformers import OffloadedCache
+import jsonlines
+
+cache_to_cache = {
+    "default" : OffloadedCache,
+    "h2o" : custom_cache.H2OCache,
+    "snapkv" : custom_cache.SnapKVCache,
+}
+
+cache_to_attention = {
+    "h2o" : llama_attention.LlamaAttentionH2O,
+    "snapkv" : llama_attention.LlamaAttentionSnapKV,
+}
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, default=None, choices=["llama2-7b-chat-4k", "longchat-v1.5-7b-32k", "xgen-7b-8k", "internlm-7b-8k", "chatglm2-6b", "chatglm2-6b-32k", "chatglm3-6b-32k", "vicuna-v1.5-7b-16k"])
+    parser.add_argument('--model', type=str, default=None, choices=["LWM-1M","llama2-7b-chat-4k", "longchat-v1.5-7b-32k", "xgen-7b-8k", "internlm-7b-8k", "chatglm2-6b", "chatglm2-6b-32k", "chatglm3-6b-32k", "vicuna-v1.5-7b-16k"])
     parser.add_argument('--e', action='store_true', help="Evaluate on LongBench-E")
+    parser.add_argument('--cache', default = 'default')
     return parser.parse_args(args)
 
 # This is the customized building prompt for chat models
@@ -48,11 +63,14 @@ def post_process(response, model_name):
         response = response.split("<eoa>")[0]
     return response
 
-def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset, device, model_name, model2path, out_path):
+def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset, device, model_name, model2path, out_path, cache_name, cache_config):
     device = torch.device(f'cuda:{rank}')
-    model, tokenizer = load_model_and_tokenizer(model2path[model_name], model_name, device)
+    model, tokenizer = load_model_and_tokenizer(model2path[model_name], model_name, device, cache_name)
     for json_obj in tqdm(data):
+        json_obj = data[27]
+        
         prompt = prompt_format.format(**json_obj)
+        #if 
         # truncate to fit max_length (we suggest truncate in the middle, since the left and right side may contain crucial instructions)
         tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
         if "chatglm3" in model_name:
@@ -67,6 +85,9 @@ def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset
                 input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
             else:
                 input = prompt.to(device)
+        elif 'LWM' in model_name:
+            prompt = "You are a helpful assistant. USER: " +prompt +" ASSISTANT: "
+            input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
         else:
             input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
         context_length = input.input_ids.shape[-1]
@@ -77,16 +98,21 @@ def get_pred(rank, world_size, data, max_length, max_gen, prompt_format, dataset
                 num_beams=1,
                 do_sample=False,
                 temperature=1.0,
+                past_key_values=cache_to_cache[cache_name],#custom_cache.H2OCache(recent = 0, hh = 4096),
                 min_length=context_length+1,
                 eos_token_id=[tokenizer.eos_token_id, tokenizer.encode("\n", add_special_tokens=False)[-1]],
             )[0]
         else:
+            print(cache_name)
+            print(cache_to_cache[cache_name])
             output = model.generate(
                 **input,
                 max_new_tokens=max_gen,
                 num_beams=1,
                 do_sample=False,
                 temperature=1.0,
+                past_key_values=cache_to_cache[cache_name](**cache_config),#custom_cache.H2OCache(recent = 0, hh = 4096),
+                use_cache = True
             )[0]
         pred = tokenizer.decode(output[context_length:], skip_special_tokens=True)
         pred = post_process(pred, model_name)
@@ -104,14 +130,15 @@ def seed_everything(seed):
     torch.backends.cudnn.deterministic = True
     torch.cuda.manual_seed_all(seed)
 
-def load_model_and_tokenizer(path, model_name, device):
+def load_model_and_tokenizer(path, model_name, device, cache_name):
     if "chatglm" in model_name or "internlm" in model_name or "xgen" in model_name:
         tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True, torch_dtype=torch.bfloat16).to(device)
     elif "llama2" in model_name:
-        replace_llama_attn_with_flash_attn()
+        #replace_llama_attn_with_flash_attn()
         tokenizer = LlamaTokenizer.from_pretrained(path)
-        model = LlamaForCausalLM.from_pretrained(path, torch_dtype=torch.bfloat16).to(device)
+        model = LlamaForCausalLM.from_pretrained(path, torch_dtype=torch.bfloat16, device_map = 'auto')#.to(device)
+        model = llama_attention.convert(model,llama_attention.LlamaAttentionH2O, model.device)
     elif "longchat" in model_name or "vicuna" in model_name:
         from fastchat.model import load_model
         replace_llama_attn_with_flash_attn()
@@ -125,11 +152,17 @@ def load_model_and_tokenizer(path, model_name, device):
         )
         model = model.to(device)
         model = model.bfloat16()
-        tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, use_fast=False)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.bfloat16, local_files_only=True, cache_dir = '/home/younes19/scratch/huggingface/cache')
+        if cache_name != 'default':
+            llama_attention.convert(model,cache_to_attention[cache_name])
+        model.to(device)
+        tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True,  cache_dir = '/home/younes19/scratch/huggingface/cache')
     model = model.eval()
     return model, tokenizer
 
 if __name__ == '__main__':
+    
     seed_everything(42)
     args = parse_args()
     world_size = torch.cuda.device_count()
@@ -137,8 +170,12 @@ if __name__ == '__main__':
 
     model2path = json.load(open("config/model2path.json", "r"))
     model2maxlen = json.load(open("config/model2maxlen.json", "r"))
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model_name = args.model
+    cache_name = args.cache
+    cache_config = json.load(open("config/cacheconfig.json", "r"))[cache_name]
+    
     # define your model
     max_length = model2maxlen[model_name]
     if args.e:
@@ -148,6 +185,8 @@ if __name__ == '__main__':
         datasets = ["narrativeqa", "qasper", "multifieldqa_en", "multifieldqa_zh", "hotpotqa", "2wikimqa", "musique", \
                     "dureader", "gov_report", "qmsum", "multi_news", "vcsum", "trec", "triviaqa", "samsum", "lsht", \
                     "passage_count", "passage_retrieval_en", "passage_retrieval_zh", "lcc", "repobench-p"]
+        datasets = ["narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", "gov_report", \
+                    "qmsum", "multi_news" , "trec", "triviaqa", "samsum", "passage_count", "passage_retrieval_en", "lcc", "repobench-p" ]
     # we design specific prompt format and max generation length for each task, feel free to modify them to optimize model output
     dataset2prompt = json.load(open("config/dataset2prompt.json", "r"))
     dataset2maxlen = json.load(open("config/dataset2maxlen.json", "r"))
@@ -158,15 +197,21 @@ if __name__ == '__main__':
         os.makedirs("pred_e")
     for dataset in datasets:
         if args.e:
-            data = load_dataset('THUDM/LongBench', f"{dataset}_e", split='test')
+            #data = load_dataset('THUDM/LongBench', f"{dataset}_e", split='test')
+            with jsonlines.open(f'/home/younes19/scratch/longbench_data/{dataset}_e.jsonl') as reader:
+                data = list(reader)
             if not os.path.exists(f"pred_e/{model_name}"):
                 os.makedirs(f"pred_e/{model_name}")
             out_path = f"pred_e/{model_name}/{dataset}.jsonl"
         else:
-            data = load_dataset('THUDM/LongBench', dataset, split='test')
+            #data = load_dataset('THUDM/LongBench', dataset, split='test')
+            with jsonlines.open(f'/home/younes19/scratch/longbench_data/{dataset}.jsonl') as reader:
+                data = list(reader)
             if not os.path.exists(f"pred/{model_name}"):
                 os.makedirs(f"pred/{model_name}")
             out_path = f"pred/{model_name}/{dataset}.jsonl"
+        if os.path.exists(out_path):
+            continue
         prompt_format = dataset2prompt[dataset]
         max_gen = dataset2maxlen[dataset]
         data_all = [data_sample for data_sample in data]
@@ -174,7 +219,7 @@ if __name__ == '__main__':
         processes = []
         for rank in range(world_size):
             p = mp.Process(target=get_pred, args=(rank, world_size, data_subsets[rank], max_length, \
-                        max_gen, prompt_format, dataset, device, model_name, model2path, out_path))
+                        max_gen, prompt_format, dataset, device, model_name, model2path, out_path, cache_name, cache_config))
             p.start()
             processes.append(p)
         for p in processes:
